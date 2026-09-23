@@ -224,3 +224,7 @@ while True:
 
     else:
         print("Erro: Opção inválida.")
+        continue
+    
+
+    

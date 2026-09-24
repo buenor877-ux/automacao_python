@@ -33,7 +33,9 @@ while True:
     print("2. Listar Produtos")
     print("3. Editar Produto")
     print("4. Deletar Produto")
-    print("5. Sair")
+    print("5. Ver Valor total do estoque")
+    print("6. Ver quantidade de produtos")
+    print("7. Sair")
 
     try:
         opcao = int(input("Digite a opção: "))
@@ -216,9 +218,19 @@ while True:
             print("Produto deletado com sucesso.")
         else:
             print("Erro: Produto não encontrado.")
+    # VER VALOR TOTAL DO ESTOQUE
+    elif opcao == 5:
+        total = banco.total_estoque()
+        total_formatado = f"{total:.2f}".replace(".", ",")
+        print(f"Valor total do estoque: R$ {total_formatado}")
+
+    # VER QUANTIDADE DE PRODUTOS
+    elif opcao == 6:
+        quantidade = banco.quantidade_estoque()
+        print(f"Quantidade de produtos: {quantidade}")
 
     # SAIR
-    elif opcao == 5:
+    elif opcao == 7:
         print("Programa encerrado.")
         break
 

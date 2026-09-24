@@ -128,6 +128,25 @@ def deletar_produto(id):
     conexao.close()
     return True
 
+def total_estoque():
+    total = 0
 
+    produtos = listar_produtos()
 
+    for produto in produtos:
+        total += produto[2] * produto[3]
+
+    return total
+
+def quantidade_estoque():
+    total = 0
+
+    produtos = listar_produtos()
+
+    for produto in produtos:
+        total += produto[3]
+
+    return total
+
+    
 

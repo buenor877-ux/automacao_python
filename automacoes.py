@@ -1,21 +1,17 @@
-import csv
+import io
 import logging
 import os
 import sqlite3
 from datetime import datetime
+
+import pandas as pd
 
 import banco
 
 PASTA_BACKUPS = os.path.join(banco.PASTA_PROJETO, "backups")
 PASTA_RELATORIOS = os.path.join(banco.PASTA_PROJETO, "relatorios")
 PASTA_LOGS = os.path.join(banco.PASTA_PROJETO, "logs")
-
-# O Excel é opcional: sem o openpyxl instalado, os relatórios saem em CSV
-try:
-    import openpyxl
-    from openpyxl.styles import Font, PatternFill
-except ImportError:
-    openpyxl = None
+ARQUIVO_LOG = os.path.join(PASTA_LOGS, "automacao.log")
 
 log = logging.getLogger("automacao")
 
@@ -23,7 +19,7 @@ log = logging.getLogger("automacao")
 def configurar_log():
     os.makedirs(PASTA_LOGS, exist_ok=True)
     if not log.handlers:
-        handler = logging.FileHandler(os.path.join(PASTA_LOGS, "automacao.log"), encoding="utf-8")
+        handler = logging.FileHandler(ARQUIVO_LOG, encoding="utf-8")
         handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%d/%m/%Y %H:%M:%S"))
         log.addHandler(handler)
         log.setLevel(logging.INFO)
@@ -36,7 +32,9 @@ def formatar_moeda(valor):
 
 
 def converter_numero(texto):
-    # Aceita "10,50", "10.50" e "1.234,56"
+    # Aceita 10.5, "10,50", "10.50" e "1.234,56"
+    if isinstance(texto, (int, float)):
+        return float(texto)
     original = texto
     texto = str(texto).strip().replace("R$", "").strip()
     if "," in texto:
@@ -47,144 +45,161 @@ def converter_numero(texto):
         raise ValueError(f"número inválido: '{original}'") from None
 
 
+# TABELAS (pandas)
+
+def tabela_estoque():
+    df = banco.consultar(
+        "SELECT id, nome, preco, quantidade, estoque_minimo FROM produtos ORDER BY nome COLLATE NOCASE"
+    )
+    df["valor_total"] = df["preco"] * df["quantidade"]
+    repor = (df["estoque_minimo"] > 0) & (df["quantidade"] <= df["estoque_minimo"])
+    df["situacao"] = repor.map({True: "Repor", False: "OK"})
+    return df
+
+
+def tabela_movimentacoes():
+    df = banco.consultar("""
+        SELECT m.id, m.data, p.nome AS produto, m.tipo, m.quantidade, m.observacao
+        FROM movimentacoes m JOIN produtos p ON p.id = m.produto_id
+        ORDER BY m.id DESC
+    """)
+    df["data"] = pd.to_datetime(df["data"])
+    return df
+
+
 # BACKUP
 
 def fazer_backup(manter=10):
-    """Copia o banco para a pasta backups/ e apaga os backups mais antigos além de `manter`."""
+    """Copia o banco para backups/ e apaga os backups mais antigos além de `manter`."""
     os.makedirs(PASTA_BACKUPS, exist_ok=True)
-    nome = f"empresa_{datetime.now():%Y-%m-%d_%H-%M-%S}.db"
-    destino = os.path.join(PASTA_BACKUPS, nome)
+    destino = os.path.join(PASTA_BACKUPS, f"empresa_{datetime.now():%Y-%m-%d_%H-%M-%S}.db")
 
     # A API de backup do SQLite copia com segurança mesmo com o banco aberto
-    origem = sqlite3.connect(banco.CAMINHO_DB)
-    copia = sqlite3.connect(destino)
+    origem, copia = sqlite3.connect(banco.CAMINHO_DB), sqlite3.connect(destino)
     try:
         origem.backup(copia)
     finally:
         copia.close()
         origem.close()
 
-    backups = sorted(
-        arquivo for arquivo in os.listdir(PASTA_BACKUPS)
-        if arquivo.startswith("empresa_") and arquivo.endswith(".db")
-    )
-    for antigo in backups[:-manter]:
+    for antigo in listar_backups()[manter:]:
         os.remove(os.path.join(PASTA_BACKUPS, antigo))
 
-    log.info("Backup criado: %s", nome)
+    log.info("Backup criado: %s", os.path.basename(destino))
     return destino
 
 
-# EXPORTAÇÃO
-
-def exportar_estoque():
-    """Gera a planilha do estoque em relatorios/. Retorna o caminho do arquivo."""
-    os.makedirs(PASTA_RELATORIOS, exist_ok=True)
-    produtos = banco.listar_produtos()
-    cabecalho = ["ID", "Nome", "Preço", "Quantidade", "Estoque mínimo", "Valor total", "Situação"]
-
-    linhas = []
-    for produto in produtos:
-        abaixo = produto["estoque_minimo"] > 0 and produto["quantidade"] <= produto["estoque_minimo"]
-        linhas.append([
-            produto["id"],
-            produto["nome"],
-            produto["preco"],
-            produto["quantidade"],
-            produto["estoque_minimo"],
-            produto["preco"] * produto["quantidade"],
-            "REPOR" if abaixo else "OK",
-        ])
-
-    data = f"{datetime.now():%Y-%m-%d}"
-
-    if openpyxl is not None:
-        caminho = os.path.join(PASTA_RELATORIOS, f"estoque_{data}.xlsx")
-        planilha = openpyxl.Workbook()
-        aba = planilha.active
-        aba.title = "Estoque"
-        aba.append(cabecalho)
-
-        for celula in aba[1]:
-            celula.font = Font(bold=True, color="FFFFFF")
-            celula.fill = PatternFill("solid", fgColor="305496")
-
-        for linha in linhas:
-            aba.append(linha)
-            if linha[-1] == "REPOR":
-                for celula in aba[aba.max_row]:
-                    celula.fill = PatternFill("solid", fgColor="F8CBAD")
-
-        for linha in aba.iter_rows(min_row=2):
-            linha[2].number_format = '"R$" #,##0.00'
-            linha[5].number_format = '"R$" #,##0.00'
-
-        larguras = [6, 30, 14, 12, 16, 16, 10]
-        for indice, largura in enumerate(larguras):
-            aba.column_dimensions[chr(65 + indice)].width = largura
-
-        planilha.save(caminho)
-    else:
-        caminho = os.path.join(PASTA_RELATORIOS, f"estoque_{data}.csv")
-        # utf-8-sig e ";" fazem o Excel em português abrir o CSV direto, com acentos certos
-        with open(caminho, "w", newline="", encoding="utf-8-sig") as arquivo:
-            escritor = csv.writer(arquivo, delimiter=";")
-            escritor.writerow(cabecalho)
-            for linha in linhas:
-                linha[2] = f"{linha[2]:.2f}".replace(".", ",")
-                linha[5] = f"{linha[5]:.2f}".replace(".", ",")
-                escritor.writerow(linha)
-
-    log.info("Estoque exportado: %s", os.path.basename(caminho))
-    return caminho
+def listar_backups():
+    if not os.path.isdir(PASTA_BACKUPS):
+        return []
+    return sorted(
+        (arquivo for arquivo in os.listdir(PASTA_BACKUPS) if arquivo.startswith("empresa_") and arquivo.endswith(".db")),
+        reverse=True,
+    )
 
 
-# IMPORTAÇÃO
+# PLANILHAS
 
-def ler_planilha(caminho):
-    """Lê um .csv ou .xlsx e devolve uma lista de dicionários com cabeçalhos em minúsculo."""
-    if caminho.lower().endswith(".xlsx"):
-        if openpyxl is None:
-            raise RuntimeError("Para ler .xlsx instale o openpyxl: pip install openpyxl")
-        planilha = openpyxl.load_workbook(caminho, read_only=True, data_only=True)
-        linhas = list(planilha.active.iter_rows(values_only=True))
-        planilha.close()
-        if not linhas:
-            return []
-        cabecalho = [str(coluna or "").strip().lower() for coluna in linhas[0]]
-        return [dict(zip(cabecalho, linha)) for linha in linhas[1:] if any(linha)]
-
-    with open(caminho, newline="", encoding="utf-8-sig") as arquivo:
-        amostra = arquivo.read(2048)
-        arquivo.seek(0)
-        separador = ";" if amostra.count(";") >= amostra.count(",") else ","
-        leitor = csv.DictReader(arquivo, delimiter=separador)
-        return [
-            {chave.strip().lower(): valor for chave, valor in linha.items() if chave}
-            for linha in leitor
-        ]
-
-
-def importar_planilha(caminho):
+def gerar_planilha(destino=None):
     """
-    Colunas esperadas: nome, preco, quantidade e, opcionalmente, estoque_minimo.
+    Gera um Excel com as abas Resumo, Estoque, Repor e Movimentações.
+    Sem `destino`, devolve os bytes do arquivo (para o botão de download).
+    """
+    estoque = tabela_estoque()
+    movimentacoes = tabela_movimentacoes()
+    resumo = pd.DataFrame({
+        "Indicador": ["Gerado em", "Produtos cadastrados", "Unidades em estoque", "Valor do estoque", "Produtos para repor"],
+        "Valor": [
+            f"{datetime.now():%d/%m/%Y %H:%M}",
+            len(estoque),
+            int(estoque["quantidade"].sum()),
+            formatar_moeda(estoque["valor_total"].sum()),
+            int((estoque["situacao"] == "Repor").sum()),
+        ],
+    })
+
+    nomes_colunas = {
+        "id": "ID", "nome": "Nome", "preco": "Preço", "quantidade": "Quantidade",
+        "estoque_minimo": "Estoque mínimo", "valor_total": "Valor total", "situacao": "Situação",
+        "data": "Data", "produto": "Produto", "tipo": "Tipo", "observacao": "Observação",
+    }
+    abas = {
+        "Resumo": resumo,
+        "Estoque": estoque.rename(columns=nomes_colunas),
+        "Repor": estoque[estoque["situacao"] == "Repor"].rename(columns=nomes_colunas),
+        "Movimentações": movimentacoes.rename(columns=nomes_colunas),
+    }
+
+    saida = destino or io.BytesIO()
+    with pd.ExcelWriter(saida, engine="openpyxl", datetime_format="DD/MM/YYYY HH:MM") as excel:
+        for nome, df in abas.items():
+            df.to_excel(excel, sheet_name=nome, index=False)
+            aba = excel.sheets[nome]
+            aba.freeze_panes = "A2"
+            aba.auto_filter.ref = aba.dimensions
+            # Largura de cada coluna de acordo com o maior texto
+            for coluna in aba.columns:
+                largura = max(len(str(celula.value or "")) for celula in coluna)
+                aba.column_dimensions[coluna[0].column_letter].width = min(largura + 3, 45)
+                if coluna[0].value in ("Preço", "Valor total"):
+                    for celula in coluna[1:]:
+                        celula.number_format = '"R$" #,##0.00'
+
+    if destino is None:
+        return saida.getvalue()
+    log.info("Planilha gerada: %s", os.path.basename(destino))
+    return destino
+
+
+def modelo_importacao():
+    """Planilha de exemplo para o usuário preencher e importar."""
+    exemplo = pd.DataFrame({
+        "nome": ["Caneta azul", "Caderno 10 matérias"],
+        "preco": [2.50, 24.90],
+        "quantidade": [100, 30],
+        "estoque_minimo": [20, 5],
+    })
+    saida = io.BytesIO()
+    exemplo.to_excel(saida, index=False)
+    return saida.getvalue()
+
+
+def ler_planilha(arquivo, nome_arquivo):
+    """Lê .xlsx ou .csv (caminho ou arquivo enviado) e padroniza os nomes das colunas."""
+    if nome_arquivo.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(arquivo, dtype=str)
+    else:
+        # sep=None descobre sozinho se o separador é ";" ou ","
+        df = pd.read_csv(arquivo, sep=None, engine="python", dtype=str, encoding="utf-8-sig")
+
+    df.columns = (
+        df.columns.str.strip().str.lower()
+        .str.replace("ç", "c").str.replace("í", "i").str.replace(" ", "_")
+    )
+    faltando = {"nome", "preco", "quantidade"} - set(df.columns)
+    if faltando:
+        raise ValueError(f"Colunas obrigatórias faltando: {', '.join(sorted(faltando))}")
+    if "estoque_minimo" not in df.columns:
+        df["estoque_minimo"] = "0"
+    return df.dropna(how="all")
+
+
+def importar_planilha(df):
+    """
     Produto novo é cadastrado; produto existente recebe uma entrada com a quantidade.
     Retorna um dicionário com o resumo da importação.
     """
     resumo = {"cadastrados": 0, "atualizados": 0, "erros": []}
 
-    for numero, linha in enumerate(ler_planilha(caminho), start=2):
+    for numero, linha in enumerate(df.fillna("").to_dict("records"), start=2):
         try:
-            nome = str(linha.get("nome") or "").strip()
+            nome = str(linha["nome"]).strip()
             if not nome:
                 raise ValueError("nome vazio")
-
-            preco = converter_numero(linha.get("preco") or linha.get("preço"))
-            quantidade = int(converter_numero(linha.get("quantidade") or 0))
-            minimo = linha.get("estoque_minimo") or linha.get("estoque mínimo") or 0
-            estoque_minimo = int(converter_numero(minimo))
-
-            if preco < 0 or quantidade < 0 or estoque_minimo < 0:
+            preco = converter_numero(linha["preco"])
+            quantidade = int(converter_numero(linha["quantidade"] or 0))
+            estoque_minimo = int(converter_numero(linha["estoque_minimo"] or 0))
+            if min(preco, quantidade, estoque_minimo) < 0:
                 raise ValueError("valores negativos")
 
             existente = banco.produto_existe(nome)
@@ -196,71 +211,39 @@ def importar_planilha(caminho):
                 if quantidade > 0:
                     banco.registrar_movimentacao(existente["id"], "entrada", quantidade, "Importado de planilha")
                 resumo["atualizados"] += 1
-
         except (ValueError, TypeError) as erro:
             resumo["erros"].append(f"Linha {numero}: {erro}")
 
     log.info(
-        "Importação de %s: %d cadastrados, %d atualizados, %d erros",
-        os.path.basename(caminho), resumo["cadastrados"], resumo["atualizados"], len(resumo["erros"])
+        "Importação: %d cadastrados, %d atualizados, %d erros",
+        resumo["cadastrados"], resumo["atualizados"], len(resumo["erros"])
     )
     return resumo
 
 
-# RELATÓRIO DIÁRIO
-
-def gerar_relatorio_diario():
-    """Gera relatorios/relatorio_AAAA-MM-DD.txt com resumo, alertas e movimentações do dia."""
-    os.makedirs(PASTA_RELATORIOS, exist_ok=True)
-    hoje = datetime.now()
-    caminho = os.path.join(PASTA_RELATORIOS, f"relatorio_{hoje:%Y-%m-%d}.txt")
-
-    abaixo = banco.produtos_abaixo_do_minimo()
-    movimentacoes = banco.movimentacoes_do_dia(f"{hoje:%Y-%m-%d}")
-
-    linhas = [
-        f"RELATÓRIO DE ESTOQUE - {hoje:%d/%m/%Y %H:%M}",
-        "=" * 50,
-        f"Produtos cadastrados: {banco.total_produtos()}",
-        f"Unidades em estoque:  {banco.quantidade_estoque()}",
-        f"Valor do estoque:     {formatar_moeda(banco.total_estoque())}",
-        "",
-        f"ALERTAS - PRODUTOS PARA REPOR ({len(abaixo)})",
-        "-" * 50,
-    ]
-    if abaixo:
-        for produto in abaixo:
-            linhas.append(
-                f"  {produto['nome']}: {produto['quantidade']} em estoque (mínimo {produto['estoque_minimo']})"
-            )
-    else:
-        linhas.append("  Nenhum produto abaixo do estoque mínimo.")
-
-    linhas += ["", f"MOVIMENTAÇÕES DE HOJE ({len(movimentacoes)})", "-" * 50]
-    if movimentacoes:
-        for mov in movimentacoes:
-            sinal = "+" if mov["tipo"] == "entrada" else "-"
-            obs = f" ({mov['observacao']})" if mov["observacao"] else ""
-            linhas.append(f"  {mov['data'][11:16]}  {sinal}{mov['quantidade']:<5} {mov['nome']}{obs}")
-    else:
-        linhas.append("  Nenhuma movimentação hoje.")
-
-    with open(caminho, "w", encoding="utf-8") as arquivo:
-        arquivo.write("\n".join(linhas) + "\n")
-
-    log.info("Relatório diário gerado: %s", os.path.basename(caminho))
-    return caminho
-
+# ROTINA DIÁRIA
 
 def rotina_diaria():
-    """Tudo o que deve rodar sozinho todo dia: backup, planilha e relatório."""
+    """O que roda sozinho todo dia: backup do banco e planilha completa em relatorios/."""
     log.info("Rotina diária iniciada")
+    os.makedirs(PASTA_RELATORIOS, exist_ok=True)
+    tarefas = [
+        fazer_backup,
+        lambda: gerar_planilha(os.path.join(PASTA_RELATORIOS, f"estoque_{datetime.now():%Y-%m-%d}.xlsx")),
+    ]
     arquivos = []
-    for tarefa in (fazer_backup, exportar_estoque, gerar_relatorio_diario):
+    for tarefa in tarefas:
         try:
             arquivos.append(tarefa())
         except Exception:
             # Uma tarefa que falha não impede as outras; o erro completo fica no log
-            log.exception("Falha em %s", tarefa.__name__)
+            log.exception("Falha na rotina diária")
     log.info("Rotina diária finalizada")
     return arquivos
+
+
+def ultimas_linhas_log(quantidade=30):
+    if not os.path.isfile(ARQUIVO_LOG):
+        return ""
+    with open(ARQUIVO_LOG, encoding="utf-8") as arquivo:
+        return "".join(arquivo.readlines()[-quantidade:])

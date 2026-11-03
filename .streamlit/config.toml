@@ -1,0 +1,13 @@
+[theme]
+primaryColor = "#2563eb"
+backgroundColor = "#f7f9fc"
+secondaryBackgroundColor = "#e9eef6"
+textColor = "#1f2937"
+
+[server]
+headless = false
+# Só este computador acessa o sistema (não fica aberto para a rede)
+address = "localhost"
+
+[browser]
+gatherUsageStats = false

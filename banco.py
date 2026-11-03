@@ -8,6 +8,12 @@ import pandas as pd
 PASTA_PROJETO = os.path.dirname(os.path.abspath(__file__))
 CAMINHO_DB = os.path.join(PASTA_PROJETO, "empresa.db")
 
+# Campos de cada cadastro auxiliar (usado pelas funções genéricas e pela interface)
+CADASTROS = {
+    "categorias": ["nome"],
+    "fornecedores": ["nome", "telefone", "email"],
+}
+
 
 @contextmanager
 def conectar():
@@ -33,24 +39,27 @@ def consultar(sql, parametros=()):
 
 def inicializar_banco():
     with conectar() as conexao:
-        conexao.execute("""
+        conexao.executescript("""
+        CREATE TABLE IF NOT EXISTS categorias (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL UNIQUE COLLATE NOCASE
+        );
+
+        CREATE TABLE IF NOT EXISTS fornecedores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            telefone TEXT,
+            email TEXT
+        );
+
         CREATE TABLE IF NOT EXISTS produtos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             nome TEXT NOT NULL,
             preco REAL NOT NULL,
             quantidade INTEGER NOT NULL DEFAULT 0,
             estoque_minimo INTEGER NOT NULL DEFAULT 0
-        )
-        """)
+        );
 
-        # Bancos criados pela primeira versão não têm a coluna estoque_minimo
-        colunas = [coluna["name"] for coluna in conexao.execute("PRAGMA table_info(produtos)")]
-        if "estoque_minimo" not in colunas:
-            conexao.execute(
-                "ALTER TABLE produtos ADD COLUMN estoque_minimo INTEGER NOT NULL DEFAULT 0"
-            )
-
-        conexao.execute("""
         CREATE TABLE IF NOT EXISTS movimentacoes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             produto_id INTEGER NOT NULL REFERENCES produtos(id) ON DELETE CASCADE,
@@ -58,17 +67,75 @@ def inicializar_banco():
             quantidade INTEGER NOT NULL CHECK (quantidade > 0),
             observacao TEXT,
             data TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
-        )
+        );
         """)
+
+        # Bancos de versões anteriores não têm estas colunas: são adicionadas sem perder dados
+        colunas_novas = {
+            "estoque_minimo": "INTEGER NOT NULL DEFAULT 0",
+            "categoria_id": "INTEGER REFERENCES categorias(id) ON DELETE SET NULL",
+            "fornecedor_id": "INTEGER REFERENCES fornecedores(id) ON DELETE SET NULL",
+        }
+        existentes = [coluna["name"] for coluna in conexao.execute("PRAGMA table_info(produtos)")]
+        for coluna, definicao in colunas_novas.items():
+            if coluna not in existentes:
+                conexao.execute(f"ALTER TABLE produtos ADD COLUMN {coluna} {definicao}")
+
+
+# CATEGORIAS E FORNECEDORES
+
+def _validar_tabela(tabela):
+    if tabela not in CADASTROS:
+        raise ValueError(f"Cadastro desconhecido: {tabela}")
+
+
+def listar(tabela):
+    _validar_tabela(tabela)
+    return consultar(f"SELECT * FROM {tabela} ORDER BY nome")
+
+
+def adicionar(tabela, **campos):
+    """Adiciona uma categoria ou fornecedor. Gera ValueError se o nome já existir."""
+    _validar_tabela(tabela)
+    campos = {chave: valor for chave, valor in campos.items() if chave in CADASTROS[tabela]}
+    try:
+        with conectar() as conexao:
+            cursor = conexao.execute(
+                f"INSERT INTO {tabela} ({', '.join(campos)}) VALUES ({', '.join('?' * len(campos))})",
+                tuple(campos.values())
+            )
+            return cursor.lastrowid
+    except sqlite3.IntegrityError:
+        raise ValueError(f"\"{campos.get('nome')}\" já está cadastrado.") from None
+
+
+def excluir(tabela, id):
+    # Os produtos ligados a este registro ficam "sem categoria"/"sem fornecedor"
+    _validar_tabela(tabela)
+    with conectar() as conexao:
+        return conexao.execute(f"DELETE FROM {tabela} WHERE id = ?", (id,)).rowcount > 0
+
+
+def obter_ou_criar(tabela, nome):
+    """Devolve o id do registro com esse nome, criando se não existir. Nome vazio -> None."""
+    _validar_tabela(tabela)
+    nome = str(nome or "").strip()
+    if not nome:
+        return None
+    with conectar() as conexao:
+        linha = conexao.execute(f"SELECT id FROM {tabela} WHERE nome = ?", (nome,)).fetchone()
+    return linha["id"] if linha else adicionar(tabela, nome=nome)
 
 
 # PRODUTOS
 
-def cadastrar_produto(nome, preco, quantidade, estoque_minimo=0, observacao="Cadastro inicial"):
+def cadastrar_produto(nome, preco, quantidade, estoque_minimo=0, observacao="Cadastro inicial",
+                      categoria_id=None, fornecedor_id=None):
     with conectar() as conexao:
         cursor = conexao.execute(
-            "INSERT INTO produtos (nome, preco, quantidade, estoque_minimo) VALUES (?, ?, ?, ?)",
-            (nome, preco, quantidade, estoque_minimo)
+            """INSERT INTO produtos (nome, preco, quantidade, estoque_minimo, categoria_id, fornecedor_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (nome, preco, quantidade, estoque_minimo, categoria_id, fornecedor_id)
         )
         # O estoque inicial também entra no histórico
         if quantidade > 0:
@@ -88,12 +155,21 @@ def produto_existe(nome, ignorar_id=None):
         ).fetchone()
 
 
-def editar_produto(id, nome, preco, estoque_minimo):
-    # A quantidade não é editada aqui: ela só muda por entrada/saída, para manter o histórico
+CAMPOS_EDITAVEIS = ("nome", "preco", "estoque_minimo", "categoria_id", "fornecedor_id")
+
+
+def editar_produto(id, **campos):
+    """
+    Altera só os campos informados, ex.: editar_produto(3, preco=9.9).
+    A quantidade não é editada aqui: ela só muda por entrada/saída, para manter o histórico.
+    """
+    campos = {chave: valor for chave, valor in campos.items() if chave in CAMPOS_EDITAVEIS}
+    if not campos:
+        return False
     with conectar() as conexao:
         cursor = conexao.execute(
-            "UPDATE produtos SET nome = ?, preco = ?, estoque_minimo = ? WHERE id = ?",
-            (nome, preco, estoque_minimo, id)
+            f"UPDATE produtos SET {', '.join(f'{chave} = ?' for chave in campos)} WHERE id = ?",
+            (*campos.values(), id)
         )
         return cursor.rowcount > 0
 

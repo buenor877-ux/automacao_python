@@ -7,3 +7,7 @@ backups/
 relatorios/
 logs/
 versao_anterior/
+
+# Configuração de e-mail (contém a senha de app)
+config_email.json
+.pytest_cache/

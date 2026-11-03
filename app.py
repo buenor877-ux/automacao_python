@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 
-import pandas as pd
 import streamlit as st
 
 import automacoes as auto
@@ -22,6 +21,12 @@ if "aviso" in st.session_state:
     st.toast(mensagem, icon=icone)
 
 
+def ids_por_nome(tabela):
+    """{"Papelaria": 1, ...} para converter o nome escolhido na tela no id do banco."""
+    df = banco.listar(tabela)
+    return dict(zip(df["nome"], df["id"]))
+
+
 # PÁGINAS
 
 def painel():
@@ -39,8 +44,11 @@ def painel():
     if not repor.empty:
         st.warning(f"**{len(repor)} produto(s) no estoque mínimo ou abaixo dele:**")
         st.dataframe(
-            repor[["nome", "quantidade", "estoque_minimo"]],
-            column_config={"nome": "Produto", "quantidade": "Em estoque", "estoque_minimo": "Mínimo"},
+            repor[["nome", "quantidade", "estoque_minimo", "fornecedor", "fornecedor_telefone"]].fillna(""),
+            column_config={
+                "nome": "Produto", "quantidade": "Em estoque", "estoque_minimo": "Mínimo",
+                "fornecedor": "Fornecedor", "fornecedor_telefone": "Telefone",
+            },
             hide_index=True,
         )
 
@@ -50,9 +58,14 @@ def painel():
 
     esquerda, direita = st.columns(2)
     with esquerda:
-        st.subheader("Valor em estoque por produto")
-        st.bar_chart(
+        st.subheader("Valor em estoque")
+        por_produto, por_categoria = st.tabs(["Por produto", "Por categoria"])
+        por_produto.bar_chart(
             estoque.nlargest(15, "valor_total"), x="nome", y="valor_total",
+            x_label="", y_label="R$", horizontal=True,
+        )
+        por_categoria.bar_chart(
+            estoque.fillna({"categoria": "Sem categoria"}).groupby("categoria")["valor_total"].sum(),
             x_label="", y_label="R$", horizontal=True,
         )
     with direita:
@@ -70,6 +83,8 @@ def painel():
 def produtos():
     st.title("📦 Produtos")
     estoque = auto.tabela_estoque()
+    categorias = ids_por_nome("categorias")
+    fornecedores = ids_por_nome("fornecedores")
 
     with st.expander("➕ Cadastrar novo produto"):
         with st.form("novo_produto", clear_on_submit=True):
@@ -78,6 +93,9 @@ def produtos():
             preco = c1.number_input("Preço (R$)", min_value=0.0, step=0.5, format="%.2f")
             quantidade = c2.number_input("Quantidade inicial", min_value=0, step=1)
             minimo = c3.number_input("Estoque mínimo (0 = sem alerta)", min_value=0, step=1)
+            c4, c5 = st.columns(2)
+            categoria = c4.selectbox("Categoria", list(categorias), index=None, placeholder="Sem categoria")
+            fornecedor = c5.selectbox("Fornecedor", list(fornecedores), index=None, placeholder="Sem fornecedor")
 
             if st.form_submit_button("Cadastrar", type="primary"):
                 nome = nome.strip()
@@ -86,35 +104,50 @@ def produtos():
                 elif banco.produto_existe(nome):
                     st.error(f"Já existe um produto chamado \"{nome}\".")
                 else:
-                    banco.cadastrar_produto(nome, preco, quantidade, minimo)
+                    banco.cadastrar_produto(
+                        nome, preco, quantidade, minimo,
+                        categoria_id=categorias.get(categoria), fornecedor_id=fornecedores.get(fornecedor),
+                    )
                     avisar(f"{nome} cadastrado.")
                     st.rerun()
 
-    busca = st.text_input("🔎 Buscar produto", placeholder="Digite parte do nome...")
+    c1, c2 = st.columns([2, 1])
+    busca = c1.text_input("🔎 Buscar produto", placeholder="Digite parte do nome...")
+    filtro_categoria = c2.multiselect("Categorias", list(categorias), placeholder="Todas")
     if busca:
         estoque = estoque[estoque["nome"].str.contains(busca, case=False, regex=False)]
+    if filtro_categoria:
+        estoque = estoque[estoque["categoria"].isin(filtro_categoria)]
 
-    st.caption("Edite nome, preço e estoque mínimo direto na tabela e clique em **Salvar alterações**. "
-               "A quantidade muda pela página Movimentações.")
+    st.caption("Edite nome, categoria, fornecedor, preço e estoque mínimo direto na tabela e clique em "
+               "**Salvar alterações**. A quantidade muda pela página Movimentações.")
 
     editado = st.data_editor(
         estoque,
         key="tabela_produtos",
         hide_index=True,
         width="stretch",
+        column_order=["id", "nome", "categoria", "fornecedor", "preco", "quantidade",
+                      "estoque_minimo", "valor_total", "situacao"],
         disabled=["id", "quantidade", "valor_total", "situacao"],
         column_config={
             "id": st.column_config.NumberColumn("ID", width="small"),
             "nome": st.column_config.TextColumn("Nome", required=True),
-            "preco": st.column_config.NumberColumn("Preço", format="R$ %.2f", min_value=0),
+            "categoria": st.column_config.SelectboxColumn("Categoria", options=list(categorias)),
+            "fornecedor": st.column_config.SelectboxColumn("Fornecedor", options=list(fornecedores)),
+            "preco": st.column_config.NumberColumn("Preço", format="R$ %.2f", min_value=0, required=True),
             "quantidade": st.column_config.NumberColumn("Quantidade"),
-            "estoque_minimo": st.column_config.NumberColumn("Estoque mínimo", min_value=0, step=1),
+            "estoque_minimo": st.column_config.NumberColumn("Estoque mínimo", min_value=0, step=1, required=True),
             "valor_total": st.column_config.NumberColumn("Valor total", format="R$ %.2f"),
             "situacao": st.column_config.TextColumn("Situação"),
         },
     )
 
-    alterados = editado[(editado[["nome", "preco", "estoque_minimo"]] != estoque[["nome", "preco", "estoque_minimo"]]).any(axis=1)]
+    editaveis = ["nome", "categoria", "fornecedor", "preco", "estoque_minimo"]
+    # fillna + astype(str): células vazias (None) contam como iguais na comparação
+    diferente = editado[editaveis].fillna("").astype(str) != estoque[editaveis].fillna("").astype(str)
+    alterados = editado[diferente.any(axis=1)]
+
     if st.button(f"💾 Salvar alterações ({len(alterados)})", disabled=alterados.empty, type="primary"):
         erros = []
         for produto in alterados.itertuples():
@@ -122,7 +155,10 @@ def produtos():
             if not nome or banco.produto_existe(nome, ignorar_id=produto.id):
                 erros.append(f"ID {produto.id}: nome vazio ou já usado por outro produto")
                 continue
-            banco.editar_produto(produto.id, nome, float(produto.preco), int(produto.estoque_minimo))
+            banco.editar_produto(
+                produto.id, nome=nome, preco=float(produto.preco), estoque_minimo=int(produto.estoque_minimo),
+                categoria_id=categorias.get(produto.categoria), fornecedor_id=fornecedores.get(produto.fornecedor),
+            )
         if erros:
             st.error("\n\n".join(erros))
         else:
@@ -137,6 +173,51 @@ def produtos():
             banco.deletar_produto(int(opcoes[escolhido]))
             avisar(f"{escolhido} excluído.", "🗑️")
             st.rerun()
+
+
+def cadastros():
+    st.title("🏷️ Categorias e fornecedores")
+    estoque = auto.tabela_estoque()
+    rotulos = {"nome": "Nome", "telefone": "Telefone", "email": "E-mail"}
+    coluna_no_estoque = {"categorias": "categoria", "fornecedores": "fornecedor"}
+
+    # As duas abas usam o mesmo código: só mudam a tabela e os campos
+    for aba, tabela in zip(st.tabs(["Categorias", "Fornecedores"]), banco.CADASTROS):
+        campos = banco.CADASTROS[tabela]
+        with aba:
+            with st.form(f"novo_{tabela}", clear_on_submit=True):
+                colunas = st.columns(len(campos))
+                valores = {campo: coluna.text_input(rotulos[campo]).strip() for campo, coluna in zip(campos, colunas)}
+                if st.form_submit_button("Adicionar", type="primary"):
+                    if not valores["nome"]:
+                        st.error("Digite o nome.")
+                    else:
+                        try:
+                            banco.adicionar(tabela, **valores)
+                            avisar(f"{valores['nome']} adicionado.")
+                            st.rerun()
+                        except ValueError as erro:
+                            st.error(str(erro))
+
+            df = banco.listar(tabela).fillna("")
+            if df.empty:
+                st.caption("Nenhum cadastro ainda.")
+                continue
+
+            uso = estoque[coluna_no_estoque[tabela]].value_counts()
+            df["produtos"] = df["nome"].map(uso).fillna(0).astype(int)
+            st.dataframe(
+                df.drop(columns="id"), hide_index=True, width="stretch",
+                column_config={**rotulos, "produtos": "Produtos ligados"},
+            )
+
+            c1, c2 = st.columns([3, 1], vertical_alignment="bottom")
+            escolhido = c1.selectbox("Excluir", df["nome"], index=None, placeholder="Escolha para excluir",
+                                     key=f"excluir_{tabela}")
+            if c2.button("Excluir", key=f"botao_excluir_{tabela}", disabled=escolhido is None):
+                banco.excluir(tabela, int(df.loc[df["nome"] == escolhido, "id"].iloc[0]))
+                avisar(f"{escolhido} excluído. Os produtos ligados a ele continuam cadastrados.", "🗑️")
+                st.rerun()
 
 
 def movimentacoes():
@@ -209,8 +290,8 @@ def planilhas():
     exportar, importar = st.tabs(["⬇️ Exportar", "⬆️ Importar"])
 
     with exportar:
-        st.write("Planilha Excel completa com as abas **Resumo**, **Estoque**, **Repor** e **Movimentações**, "
-                 "já formatada com filtros e valores em reais.")
+        st.write("Planilha Excel completa com as abas **Resumo**, **Estoque**, **Repor** (com o contato do "
+                 "fornecedor) e **Movimentações**, já formatada com filtros e valores em reais.")
         st.download_button(
             "📥 Baixar planilha do estoque",
             auto.gerar_planilha(),
@@ -219,9 +300,9 @@ def planilhas():
         )
 
     with importar:
-        st.write("Envie um **.xlsx** ou **.csv** com as colunas `nome`, `preco`, `quantidade` "
-                 "e, se quiser, `estoque_minimo`. Produtos novos são cadastrados; "
-                 "produtos que já existem recebem uma entrada com a quantidade da planilha.")
+        st.write("Envie um **.xlsx** ou **.csv** com as colunas `nome`, `preco` e `quantidade`. "
+                 "Opcionais: `estoque_minimo`, `categoria` e `fornecedor` (criados automaticamente se não existirem). "
+                 "Produtos novos são cadastrados; produtos que já existem recebem uma entrada com a quantidade da planilha.")
         st.download_button("📄 Baixar planilha modelo", auto.modelo_importacao(), file_name="modelo_importacao.xlsx")
 
         arquivo = st.file_uploader("Planilha", type=["xlsx", "csv"])
@@ -260,11 +341,47 @@ def automacoes():
 
     with c2, st.container(border=True):
         st.subheader("🗓️ Rotina diária")
-        st.caption("Faz o backup e salva a planilha completa do dia em relatorios/.")
+        st.caption("Faz o backup, salva a planilha do dia em relatorios/ e, se ativado, envia o e-mail.")
         if st.button("Rodar rotina agora", type="primary"):
-            for arquivo in auto.rotina_diaria():
-                st.success(f"Gerado: {arquivo}")
+            for resultado in auto.rotina_diaria():
+                st.success(resultado)
         st.info("Para rodar sozinha todo dia às 18h, dê dois cliques em **agendar_rotina.bat** na pasta do projeto.")
+
+    with st.container(border=True):
+        st.subheader("📧 Relatório por e-mail")
+        st.caption("Envia o resumo do estoque e os produtos para repor no corpo do e-mail, com a planilha em anexo.")
+        config = auto.carregar_config_email()
+
+        with st.form("config_email"):
+            ativo = st.toggle("Enviar automaticamente na rotina diária", value=config["ativo"])
+            c1, c2 = st.columns([3, 1])
+            servidor = c1.text_input("Servidor SMTP", config["servidor"])
+            porta = c2.number_input("Porta", value=int(config["porta"]), step=1)
+            c3, c4 = st.columns(2)
+            usuario = c3.text_input("E-mail remetente", config["usuario"])
+            senha = c4.text_input(
+                "Senha de app", config["senha"], type="password",
+                help="No Gmail, crie uma senha de app em myaccount.google.com/apppasswords "
+                     "(é preciso ter a verificação em duas etapas ativada). Não use a senha normal da conta.",
+            )
+            destinatarios = st.text_input("Destinatários (separe por vírgula)", config["destinatarios"])
+
+            if st.form_submit_button("Salvar configurações", type="primary"):
+                auto.salvar_config_email({
+                    "ativo": ativo, "servidor": servidor.strip(), "porta": int(porta),
+                    "usuario": usuario.strip(), "senha": senha, "destinatarios": destinatarios,
+                })
+                avisar("Configurações de e-mail salvas.")
+                st.rerun()
+
+        if st.button("✉️ Enviar e-mail de teste agora"):
+            with st.spinner("Enviando..."):
+                try:
+                    enviados = auto.enviar_relatorio_email()
+                    st.success(f"E-mail enviado para {', '.join(enviados)}.")
+                except Exception as erro:
+                    st.error(f"Não foi possível enviar: {erro}")
+        st.caption("As configurações ficam no arquivo config_email.json, só neste computador (não vão para o Git).")
 
     st.subheader("📜 Registro de atividades")
     st.code(auto.ultimas_linhas_log() or "Nenhuma atividade registrada ainda.", language=None)
@@ -276,6 +393,7 @@ menu = st.navigation([
     st.Page(painel, title="Painel", icon="📊", default=True),
     st.Page(produtos, title="Produtos", icon="📦"),
     st.Page(movimentacoes, title="Movimentações", icon="🔄"),
+    st.Page(cadastros, title="Categorias e fornecedores", icon="🏷️", url_path="cadastros"),
     st.Page(planilhas, title="Planilhas", icon="📑"),
     st.Page(automacoes, title="Automações", icon="⚙️"),
 ])

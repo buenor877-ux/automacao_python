@@ -21,8 +21,8 @@ def main():
 
         automacoes.configurar_log()
         banco.inicializar_banco()
-        for arquivo in automacoes.rotina_diaria():
-            print(f"Gerado: {arquivo}")
+        for resultado in automacoes.rotina_diaria():
+            print(f"- {resultado}")
     else:
         # Abre a interface no navegador
         subprocess.run([sys.executable, "-m", "streamlit", "run", os.path.join(PASTA, "app.py")])

@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+
+# Dados e arquivos gerados pelas automações
+*.db
+backups/
+relatorios/
+logs/
+versao_anterior/
